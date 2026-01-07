@@ -7,6 +7,8 @@
  * Основные возможности:
  * - Автоматическое или ручное определение видео элемента
  * - Детекция движения через сравнение кадров (RGB каналы)
+ * - Временная фильтрация шума (медианная фильтрация за 7 кадров)
+ * - Порог с гистерезисом для предотвращения ложных срабатываний
  * - Настройка зон контроля (до 12 зон)
  * - Автокалибровка порога чувствительности
  * - Визуальная и звуковая тревога
@@ -47,6 +49,13 @@
   const VOL = { def: 0.12, min: 0.01, max: 0.60, step: 0.01 };
 
   const REF_UPDATE_EVERY = 12;
+
+  // Параметры фильтрации шума (автоматическая адаптация)
+  const NOISE_FILTER = {
+    bufferSize: 7,        // размер буфера для временной фильтрации (7 кадров)
+    hysteresisRatio: 0.75, // коэффициент гистерезиса (нижний порог = 75% от верхнего)
+    useMedian: true,       // использовать медиану вместо среднего (лучше для шума)
+  };
 
   const TOGGLE_CODES = new Set(['Digit0', 'ShiftRight']); // enable/disable
   const CLEAR_CODES  = new Set(['Digit1', 'ShiftLeft']);  // clear alarm
@@ -820,6 +829,8 @@
     refCounter: 0,
 
     d: 0, dPrev: 0, dRef: 0,
+    diffBuffer: [],        // буфер последних значений разницы для фильтрации шума
+    dFiltered: 0,          // отфильтрованное значение разницы (после временной фильтрации)
     status: 'инициализация…',
 
     stop: false,
@@ -1461,6 +1472,42 @@
     S.prev = null;
     S.ref = null;
     S.refCounter = 0;
+    S.diffBuffer = [];  // очищаем буфер фильтрации при сбросе
+    S.dFiltered = 0;
+  }
+
+  // Временная фильтрация разницы для подавления шума
+  // Использует медиану или среднее значение из буфера последних кадров
+  function filterMotionDiff(rawDiff) {
+    // Добавляем новое значение в буфер
+    S.diffBuffer.push(rawDiff);
+    
+    // Ограничиваем размер буфера
+    if (S.diffBuffer.length > NOISE_FILTER.bufferSize) {
+      S.diffBuffer.shift(); // удаляем самое старое значение
+    }
+    
+    // Если буфер еще не заполнен, возвращаем исходное значение
+    if (S.diffBuffer.length < 3) {
+      return rawDiff;
+    }
+    
+    // Вычисляем фильтрованное значение (медиана лучше подавляет выбросы шума)
+    if (NOISE_FILTER.useMedian) {
+      return median(S.diffBuffer);
+    } else {
+      // Альтернатива: скользящее среднее
+      const sum = S.diffBuffer.reduce((a, b) => a + b, 0);
+      return sum / S.diffBuffer.length;
+    }
+  }
+
+  // Вычисление порогов с гистерезисом
+  // Гистерезис предотвращает дребезг тревоги при значениях около порога
+  function getThresholds() {
+    const thrHigh = S.thr;  // верхний порог (основной) - для включения тревоги
+    const thrLow = S.thr * NOISE_FILTER.hysteresisRatio;  // нижний порог - для выключения тревоги
+    return { thrHigh, thrLow };
   }
 
   function saveZones(statusMsg) {
@@ -1522,7 +1569,9 @@
 
     UI.modeChip.textContent = modeLabelFromThr(S.thr);
     UI.metaLeft.textContent = `порог=${S.thr.toFixed(2)} • режим=${UI.modeChip.textContent}`;
-    UI.metaRight.textContent = `Δ=${S.d.toFixed(2)} (пред=${S.dPrev.toFixed(2)} опорн=${S.dRef.toFixed(2)})`;
+    // Показываем отфильтрованное значение (основное) и сырое (для справки)
+    const filteredLabel = S.diffBuffer.length >= 3 ? `фильтр=${S.dFiltered.toFixed(2)}` : '';
+    UI.metaRight.textContent = `Δ=${S.dFiltered.toFixed(2)}${filteredLabel ? ' • ' + filteredLabel : ''} (сырое=${S.d.toFixed(2)})`;
 
     UI.opaRight.textContent = `прозр=${S.opacity.toFixed(2)}`;
     UI.opaChip.textContent = `${Math.round(S.opacity * 100)}%`;
@@ -1895,11 +1944,32 @@
 
         const currArr = new Uint8ClampedArray(curr);
 
+        // Вычисляем мгновенную разницу (как раньше)
         S.dPrev = motionAcrossZones(currArr, S.prev, boundsList);
         S.dRef  = S.ref ? motionAcrossZones(currArr, S.ref, boundsList) : S.dPrev;
         S.d     = Math.max(S.dPrev, S.dRef);
 
-        if (S.d > S.thr) showAlarm();
+        // Применяем временную фильтрацию для подавления шума
+        S.dFiltered = filterMotionDiff(S.d);
+
+        // Получаем пороги с гистерезисом
+        const { thrHigh, thrLow } = getThresholds();
+
+        // Логика с гистерезисом: 
+        // - Если тревога выключена: используем верхний порог для включения
+        // - Если тревога включена: используем нижний порог для выключения
+        // Это предотвращает дребезг при значениях около порога
+        if (!S.alarm) {
+          // Тревога выключена - проверяем верхний порог
+          if (S.dFiltered > thrHigh) {
+            showAlarm();
+          }
+        } else {
+          // Тревога включена - проверяем нижний порог (более низкий)
+          if (S.dFiltered < thrLow) {
+            clearAlarm();
+          }
+        }
 
         S.prev = currArr;
 
